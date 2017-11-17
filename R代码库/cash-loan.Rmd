@@ -1,0 +1,2406 @@
+---
+title: "Cash Loan Model v1.0"
+author: "Siyuan"
+date: "2017/3/10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	message = FALSE,
+	warning = FALSE
+)
+library(RODBC)
+library(autobin)
+library(ggplot2)
+library(car)
+library(woe)
+library(rPSI)
+library(pROC)
+library(ROCR)
+library(dplyr)
+library(pander)
+library(magrittr)
+source('~/Daily report/utils.R', echo = FALSE)
+
+options(digits = 4)
+options(scipen = 0)
+panderOptions('table.split.table',140) #default is 80
+```
+
+## Data Preprocessing
+
+* Target variables: 
+    * fpd90
+* Sample window: from 2016-01-01 to 2017-03-02
+    * Available for fpd90 window: 2016-01-01 to 2016-11-05
+    * Training window: 2016-01-01 to 2016-09-30, with public holidays excluded.
+    * Testing window 0: 2016-09-01 to 2016-09-30
+    * Testing window 1: 2016-10-01 to 2016-10-31
+    * Testing window 2: 2016-09-01 to 2016-10-31
+    * Testing window 3: 2016-09-01 to 2016-10-31 & Random Sample
+
+```{r sample-split}
+conn <- odbcConnect('impalaodbc', uid = 'siyuan.yao', pwd = '1d63b837fce3e3984a7c52a97292a830')
+# To perform a reproducible study, we need add `order by`, otherwise Impala will generate a dataset 
+# in a random order.
+cash.sample <- sqlQuery(conn, 'SELECT * FROM risk_analysis.cash_loan_model_variables_ling_0420 order by appl_no',
+                        as.is = TRUE, na.strings = c('NULL', '', '--'))
+conn %>% close %>% remove
+
+cash.sample <- cash.sample %>% mutate(
+    appl_tm = as.Date(appl_tm),
+    fpd90 = as.numeric(fpd90),
+    time_credit = pmax(timel_fsti, timec_fsti, times_fsti,na.rm = TRUE),
+    time_credit = time_credit %>% ifelse(is.na(.), 0, .),
+    hour_submit = substr(time_inst, 12, 13) %>% 
+        ifelse(. %in% paste0('0', 5:9), '05-09', .) %>%
+        ifelse(. %in% c('22', '23', '00', '01', '02', '03', '04'), '22-04', .) %>%
+        ifelse(. %in% c('16', '17'), '16-17', .) %>% 
+        ifelse(. %in% c('10', '11', '12', '13', '14', '15', '18', '19', '20', '21'), 'other', .) %>%
+        factor
+)
+cash.sample <- filter(cash.sample, 
+    !(appl_tm >= '2016-01-01' & appl_tm <= '2016-01-03'),
+    !(appl_tm >= '2016-02-07' & appl_tm <= '2016-02-13'),
+    !(appl_tm >= '2016-04-02' & appl_tm <= '2016-04-04'),
+    !(appl_tm >= '2016-05-01' & appl_tm <= '2016-05-03'),
+    !(appl_tm >= '2016-06-09' & appl_tm <= '2016-06-11'),
+    !(appl_tm >= '2016-09-15' & appl_tm <= '2016-09-17'),
+    !(appl_tm >= '2016-10-01' & appl_tm <= '2016-10-07'),
+    !is.na(jion_life_insure),
+    if_blank == 'N'
+)
+
+
+
+Train <- subset(cash.sample, appl_tm <= '2016-08-31')
+Test  <- subset(cash.sample, 
+                appl_tm >= '2016-09-01' & appl_tm <= '2016-09-30')
+Test1  <- subset(cash.sample, 
+                appl_tm >= '2016-09-01' & appl_tm <= '2016-10-31' & !is.na(fpd90))
+Test2  <- subset(cash.sample, 
+                appl_tm >= '2016-10-01' & appl_tm <= '2016-10-31' & !is.na(fpd90))
+# Test3  <- subset(cash.sample,
+#                 appl_tm >= '2016-09-01' & appl_tm <= '2016-10-31' & !is.na(fpd90) & aprv_type == 'RAND')
+Test3 <- cash.sample
+tr.str <- cbind(table(Train$fpd90), 
+                table(Train$fpd90) %>% prop.table() %>% multiply_by(100) %>% round(2))
+ts.str <- cbind(table(Test$fpd90), 
+                table(Test$fpd90) %>% prop.table() %>% multiply_by(100) %>% round(2))
+ts1.str <- cbind(table(Test1$fpd90), 
+                table(Test1$fpd90) %>% prop.table() %>% multiply_by(100) %>% round(2))
+ts2.str <- cbind(table(Test2$fpd90), 
+                table(Test2$fpd90) %>% prop.table() %>% multiply_by(100) %>% round(2))
+ts3.str <- cbind(table(Test3$fpd90), 
+                table(Test3$fpd90) %>% prop.table() %>% multiply_by(100) %>% round(2))
+sp.str <- cbind(tr.str, ts.str, ts1.str, ts2.str, ts3.str)
+colnames(sp.str) <- c('Train.Cnt', 'Train.Rt', 
+                      'Sep.Cnt', 'Sep.Rt',
+                      'Oct.Cnt', 'Oct.Rt',
+                      'Sep&Oct.Cnt', 'Sep&Oct.Rt',
+                      'Rand.Cnt', 'Rand.Rt')
+rownames(sp.str) <- c('Bad', 'Good')
+pander(sp.str)
+```
+
+As we will use 10-fold cross validation to measure the in-time performance of the model, no in-time testing sample will be created, so that we can use as many samples as possible while a low-variance estimate of the performance will still be retrieved.
+
+### Resampling
+
+Again, we will use a balanced sample set instead of the original set. As the number of bad customers are relatively small, it may be sensitive to some data quirks. With a balanced set, the binning results will be more robust.
+
+Here, we resample the original set to obtain a balanced set with 50,000 goods and 50,000 bads.
+
+```{r resampling}
+Train.Good <- subset(Train, fpd90 == 1)
+Train.Bad  <- subset(Train, fpd90 == 0)
+set.seed(20170310)
+Train.bal  <- rbind(
+    Train.Good,
+    Train.Good[sample(nrow(Train.Good), 
+                      50000 - nrow(Train.Good), 
+                      replace = TRUE),
+               ],
+    Train.Bad,
+    Train.Bad[sample(nrow(Train.Bad),
+                     50000 - nrow(Train.Bad),
+                     replace = TRUE),
+              ]
+)
+```
+
+
+## Variable Groupings & Information Value
+
+```{r grouping}
+Train.bal$v_gender_cd <- Train.bal$gender_cd %>% factor
+Train$v_gender_cd <- Train$gender_cd %>% factor
+Test$v_gender_cd <- Test$gender_cd %>% factor
+Test1$v_gender_cd <- Test1$gender_cd %>% factor
+Test2$v_gender_cd <- Test2$gender_cd %>% factor
+Test3$v_gender_cd <- Test3$gender_cd %>% factor
+
+Train.bal$v_diploma <- Train.bal$diploma %>%
+    ifelse(. == '文盲或半文盲', 'A', .) %>%
+    ifelse(. == '小学', 'A', .) %>%
+    ifelse(. == '技术学校', 'A', .) %>%
+    ifelse(. == '初中', 'A', .) %>%
+    ifelse(. == '高中', 'B', .) %>%
+    ifelse(. == '中等专业学校或中等技术学校', 'B', .) %>%
+    ifelse(. == '大学专科和专科学校（简称"大专"）', 'C', .) %>%
+    ifelse(. == '大学本科（简称"大学"）', 'D', .) %>%
+    ifelse(. == '研究生', 'D', .) %>% label.factor
+Train$v_diploma <- Train$diploma %>%
+    ifelse(. == '文盲或半文盲', 'A', .) %>%
+    ifelse(. == '小学', 'A', .) %>%
+    ifelse(. == '技术学校', 'A', .) %>%
+    ifelse(. == '初中', 'A', .) %>%
+    ifelse(. == '高中', 'B', .) %>%
+    ifelse(. == '中等专业学校或中等技术学校', 'B', .) %>%
+    ifelse(. == '大学专科和专科学校（简称"大专"）', 'C', .) %>%
+    ifelse(. == '大学本科（简称"大学"）', 'D', .) %>%
+    ifelse(. == '研究生', 'D', .) %>% label.factor
+Test1$v_diploma <- Test1$diploma %>%
+    ifelse(. == '文盲或半文盲', 'A', .) %>%
+    ifelse(. == '小学', 'A', .) %>%
+    ifelse(. == '技术学校', 'A', .) %>%
+    ifelse(. == '初中', 'A', .) %>%
+    ifelse(. == '高中', 'B', .) %>%
+    ifelse(. == '中等专业学校或中等技术学校', 'B', .) %>%
+    ifelse(. == '大学专科和专科学校（简称"大专"）', 'C', .) %>%
+    ifelse(. == '大学本科（简称"大学"）', 'D', .) %>%
+    ifelse(. == '研究生', 'D', .) %>% label.factor
+Test2$v_diploma <- Test2$diploma %>%
+    ifelse(. == '文盲或半文盲', 'A', .) %>%
+    ifelse(. == '小学', 'A', .) %>%
+    ifelse(. == '技术学校', 'A', .) %>%
+    ifelse(. == '初中', 'A', .) %>%
+    ifelse(. == '高中', 'B', .) %>%
+    ifelse(. == '中等专业学校或中等技术学校', 'B', .) %>%
+    ifelse(. == '大学专科和专科学校（简称"大专"）', 'C', .) %>%
+    ifelse(. == '大学本科（简称"大学"）', 'D', .) %>%
+    ifelse(. == '研究生', 'D', .) %>% label.factor
+Test3$v_diploma <- Test3$diploma %>%
+    ifelse(. == '文盲或半文盲', 'A', .) %>%
+    ifelse(. == '小学', 'A', .) %>%
+    ifelse(. == '技术学校', 'A', .) %>%
+    ifelse(. == '初中', 'A', .) %>%
+    ifelse(. == '高中', 'B', .) %>%
+    ifelse(. == '中等专业学校或中等技术学校', 'B', .) %>%
+    ifelse(. == '大学专科和专科学校（简称"大专"）', 'C', .) %>%
+    ifelse(. == '大学本科（简称"大学"）', 'D', .) %>%
+    ifelse(. == '研究生', 'D', .) %>% label.factor
+Test$v_diploma <- Test$diploma %>%
+    ifelse(. == '文盲或半文盲', 'A', .) %>%
+    ifelse(. == '小学', 'A', .) %>%
+    ifelse(. == '技术学校', 'A', .) %>%
+    ifelse(. == '初中', 'A', .) %>%
+    ifelse(. == '高中', 'B', .) %>%
+    ifelse(. == '中等专业学校或中等技术学校', 'B', .) %>%
+    ifelse(. == '大学专科和专科学校（简称"大专"）', 'C', .) %>%
+    ifelse(. == '大学本科（简称"大学"）', 'D', .) %>%
+    ifelse(. == '研究生', 'D', .) %>% label.factor
+# 
+# # woe(Train.bal, 'v_diploma', FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, 'v_diploma', FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, 'v_diploma', FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'add_corltt'
+cuts <- c(34, 42)
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts)
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts)
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts)
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# # v <- 'add_hjlng'
+# # cuts <- c(109, 113, 119, 123)
+# # Train.bal[, paste0('v_', v)] <-
+# #     label.numeric(Train.bal[, v], cuts)
+# # Train[, paste0('v_', v)] <-
+# #     label.numeric(Train[, v], cuts)
+# # Test[, paste0('v_', v)] <-
+# #     label.numeric(Test[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# # v <- 'add_hjltt'
+# # Train.bal[, paste0('v_', v)] <-
+# #     label.numeric(Train.bal[, v], cuts = c(24, 35, 38, 42))
+# # Train[, paste0('v_', v)] <-
+# #     label.numeric(Train[, v], cuts = c(24, 35, 42))
+# # Test[, paste0('v_', v)] <-
+# #     label.numeric(Test[, v], cuts = c(24, 35, 42))
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# # v <- 'numl_others'
+# # cuts <- c(0:3)
+# # Train.bal[, paste0('v_', v)] <-
+# #     label.numeric(Train.bal[, v], cuts)
+# # Train[, paste0('v_', v)] <-
+# #     label.numeric(Train[, v], cuts)
+# # Test[, paste0('v_', v)] <-
+# #     label.numeric(Test[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'time_credit'
+# cuts <- c(3, 6, 10, 27)
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# 
+v <- 'numc_acct'
+cuts = c(0, 1, 3, 5)
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts)
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts = c(0, 1, 3, 5))
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts = c(0, 1, 3, 5))
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+
+v <- 'nums_acct'
+cuts = 0
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts = 0)
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts = 0)
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts = 0)
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'numl_pd'
+# cuts = 0
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts = 0)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts = 0)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts = 0)
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'numl_pdm'
+# cuts = 0
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts = 0)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts = 0)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts = 0)
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'numl_lpdm'
+cuts = c(0, 2)
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts = c(0, 2))
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts = c(0, 2))
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts = c(0, 2))
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'numc_acctpd'
+cuts <- 0:3
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts = c(0, 1, 2, 3))
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts = c(0, 1, 2, 3))
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts = c(0, 1, 2, 3))
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'amtc_htpdever'
+cuts <- 0
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts = 0)
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts = 0)
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts = 0)
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'numc_lpdm'
+cuts <- 0
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts = 0)
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts = 0)
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts = 0)
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'numl_lpos'
+# cuts = c(1,2)
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts = c(1, 2))
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts = c(1, 2))
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts = c(1, 2))
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'numl_insos'
+cuts <- c(1,2)
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts = c(1, 2))
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts = c(1, 2))
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts = c(1, 2))
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'numl_os'
+cuts = 1:2
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts = 1:2)
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts = 1:2)
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts = 1:2)
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtl_os'
+# cuts = c(8000, 270000)
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts = c(8000, 270000))
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts = c(8000, 270000))
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts = c(8000, 270000))
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# # v <- 'amtl_osbal'
+# # Train.bal[, paste0('v_', v)] <-
+# #     label.numeric(Train.bal[, v], cuts = c(1000, 4000, 8000))
+# # Train[, paste0('v_', v)] <-
+# #     label.numeric(Train[, v], cuts = c(1000, 4000, 8000))
+# # Test[, paste0('v_', v)] <-
+# #     label.numeric(Test[, v], cuts = c(1000, 4000, 8000))
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# # v <- 'amtl_osbal'
+# # Train.bal[, paste0('v_', v)] <-
+# #     label.numeric(Train.bal[, v], cuts = c(1000, 4000, 8000))
+# # Train[, paste0('v_', v)] <-
+# #     label.numeric(Train[, v], cuts = c(1000, 4000, 8000))
+# # Test[, paste0('v_', v)] <-
+# #     label.numeric(Test[, v], cuts = c(1000, 4000, 8000))
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'amtl_apos6m'
+cuts = c(1000, 3000)
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts = c(1000, 3000))
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts = c(1000, 3000))
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts = c(1000, 3000))
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_clop'
+# cuts = c(2000, 20000, 35000, 60000)
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts = c(2000, 20000, 35000, 60000))
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts = c(2000, 20000, 35000, 60000))
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts = c(2000, 20000, 35000, 60000))
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_hclacctperins'
+# cuts = c(6000, 30000)
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts = c(6000, 30000))
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts = c(6000, 30000))
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts = c(6000, 30000))
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_lclacctperins'
+# cuts = c(0,11000)
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts = c(0, 11000))
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts = c(0, 11000))
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts = c(0, 11000))
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'amtc_utlcop'
+cuts = c(0, 7000, 28000, 67000)
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts = c(0, 7000, 28000, 67000))
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts = c(0, 7000, 28000, 67000))
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts = c(0, 7000, 28000, 67000))
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'numi_acctm2y'
+# Train.bal[,v] <- Train.bal[,v] %>% ifelse(is.na(.), 0, .)
+# Train[,v] <- Train[,v] %>% ifelse(is.na(.), 0, .)
+# cuts <- c(0, 1, 2, 7)
+# Train.bal[, paste0('v_', v)] <- label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <- label.numeric(Train[, v], cuts)
+# Test[,v][is.na(Test[,v])] <- 0
+# Test[, paste0('v_', v)] <- label.numeric(Test[, v], cuts)
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# # Train.bal$to_earn <- Train.bal$mo_earn + Train.bal$oth_earn
+# # Train$to_earn <- Train$mo_earn + Train$oth_earn
+# # Test$to_earn <- Test$mo_earn + Test$oth_earn
+# # v <- 'to_earn'
+# # cuts <- c(5000, 8000, 14000)
+# # Train.bal[, paste0('v_', v)] <- label.numeric(Train.bal[, v], cuts)
+# # Train[, paste0('v_', v)] <- label.numeric(Train[, v], cuts)
+# # Test[, paste0('v_', v)] <- label.numeric(Test[, v], cuts)
+# # Test1[, paste0('v_', v)] <-
+# #     label.numeric(Test1[, v], cuts)
+# # Test2[, paste0('v_', v)] <-
+# #     label.numeric(Test2[, v], cuts)
+# # Test3[, paste0('v_', v)] <-
+# #     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'no_mob'
+Train.bal[, paste0('v_', v)] <- label.factor(Train.bal[, v])
+Train[, paste0('v_', v)] <- label.factor(Train[, v])
+Test[, paste0('v_', v)] <- label.factor(Test[, v])
+Test1[, paste0('v_', v)] <- label.factor(Test1[,v])
+Test2[, paste0('v_', v)] <- label.factor(Test2[,v])
+Test3[, paste0('v_', v)] <- label.factor(Test3[,v])
+# woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+
+v <- 'no_telwk'
+Train.bal[, paste0('v_', v)] <- label.factor(Train.bal[, v])
+Train[, paste0('v_', v)] <- label.factor(Train[, v])
+Test[, paste0('v_', v)] <- label.factor(Test[, v])
+Test1[, paste0('v_', v)] <- label.factor(Test1[,v])
+Test2[, paste0('v_', v)] <- label.factor(Test2[,v])
+Test3[, paste0('v_', v)] <- label.factor(Test3[,v])
+# woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+
+v <- 'num_emp2y'
+cuts <- c(1, 2, 3)
+Train.bal[, paste0('v_', v)] <- label.numeric(Train.bal[, v], cuts)
+Train[, paste0('v_', v)] <- label.numeric(Train[, v], cuts)
+Test[, paste0('v_', v)] <- label.numeric(Test[, v], cuts)
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'num_empc2y'
+# cuts <- c(0, 1, 2, 4)
+# Train.bal[, paste0('v_', v)] <- label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <- label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <- label.numeric(Test[, v], cuts)
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'varsmaxcdiffreptmandisstmineffect'
+cuts <- c(127, 220, 816)
+Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts)
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts)
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts)
+Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'varsmaxcdiffreptmandisstmnotactivated'
+cuts <- 400
+Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts)
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts)
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts)
+Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+
+v <- 'rtnumcacctnormaltonumc'
+cuts <- c(0.17, 0.96)
+Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts)
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts)
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts)
+Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1sapa120'
+# cuts <- c(0, 4000, 6000, 35000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1sclw120'
+# cuts <- c(2000, 18000, 53000, 109000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1lclw120'
+# cuts <- c(9000, 12000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1mclw120'
+# cuts <- c(2000, 6000, 17000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1sapa120'
+# cuts <- c(0, 35000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1lapa120'
+# cuts <- 4000
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1mapa120'
+# cuts <- 0
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'amtc_1srpa120'
+cuts <- c(0, 1000, 2000)
+Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts)
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts)
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts)
+Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1lrpa120'
+# cuts <- 400
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1mrpa120'
+# cuts <- c(0, 1000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'amtc_1smua120'
+cuts <- c(2000, 15000, 35000)
+Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts)
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts)
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts)
+Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1mmua120'
+# cuts <- c(2000, 7000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1s6la120'
+# cuts <- c(39000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1l6la120'
+# cuts <- 500
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'amtc_1m6la120'
+cuts <- c(15000, 26000)
+Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts)
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts)
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts)
+Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'amtc_1ssla120'
+cuts <- c(20000, 59000)
+Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts)
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts)
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts)
+Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'amtc_1lsla120'
+cuts <- 0
+Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts)
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts)
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts)
+Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1msla120'
+# cuts <- c(2000, 15000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1sula120'
+# cuts <- c(2000, 16000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'amtc_1lula120'
+cuts <- c(600, 4800)
+Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts)
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts)
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts)
+Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1scla120'
+# cuts <- 53000
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'amtc_1lcla120'
+cuts <- c(2000, 3000, 8000)
+Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts)
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts)
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts)
+Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1sclw060'
+# cuts <- c(2000, 18000, 53000, 113000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1lclw060'
+# cuts <- c(2000, 3000, 10000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1mclw060'
+# cuts <- c(2000, 6000, 17000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'numc_1sccw060'
+# cuts <- c(2, 4)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1srpa060'
+# cuts <- c(0, 2000, 3700)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'numc_lpop'
+# cuts <- c(1, 2, 3, 5)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'numc_insop'
+# cuts <- c(1, 2, 3, 5)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'amtc_1srpa030'
+cuts <- c(0, 1000, 2000, 6000)
+Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts)
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts)
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts)
+Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'amtc_1srpa000'
+cuts <- c(0, 1000, 2000)
+Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts)
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts)
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts)
+Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'amtc_trp'
+cuts <- c(0, 1000, 2000)
+Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+Train.bal[, paste0('v_', v)] <-
+    label.numeric(Train.bal[, v], cuts)
+Train[, paste0('v_', v)] <-
+    label.numeric(Train[, v], cuts)
+Test[, paste0('v_', v)] <-
+    label.numeric(Test[, v], cuts)
+Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+Test1[, paste0('v_', v)] <-
+    label.numeric(Test1[, v], cuts)
+Test2[, paste0('v_', v)] <-
+    label.numeric(Test2[, v], cuts)
+Test3[, paste0('v_', v)] <-
+    label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'numc_1scca030'
+# cuts <- c(1,2,4)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'numc_1sccw030'
+# cuts <- c(1,2,4)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'numc_1scca000'
+# cuts <- c(1,2,4)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'numc_1scca060'
+# cuts <- c(1,2,4)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'numc_acctop'
+# cuts <- c(2.5, 8.5, 9.5)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1scla060'
+# cuts <- c(2000, 18000, 113000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1ssla030'
+# cuts <- c(1000, 20000, 32000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1ssla060'
+# cuts <- c(1000, 20000, 34000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'numl_act'
+# cuts <- 1:2
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1sclw030'
+# cuts <- c(6000, 32000, 113000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1scla030'
+# cuts <- c(6000, 34000, 113000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'numc_act'
+# cuts <- c(0, 1, 2, 4)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1mrpa030'
+# cuts <- c(0, 2000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1ssla000'
+# cuts <- c(0, 2000, 20000, 32000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'numc_1scca120'
+# cuts <- c(1, 2, 4)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'numc_1sccw120'
+# cuts <- c(1, 2, 4)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_acttshr'
+# cuts <- c(2000, 20000, 32000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1mrpa000'
+# cuts <- c(0, 1000, 2000)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'amtc_1mrpa060'
+# cuts <- 0
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'age'
+# cuts <- c(21, 27, 36)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'work_life'
+# cuts <- c(3.5,8.5,13.5,17.5)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# Test1[,v] <- ifelse(Test1[,v] >= 999999900, NA, Test1[,v])
+# Test2[,v] <- ifelse(Test2[,v] >= 999999900, NA, Test2[,v])
+# Test3[,v] <- ifelse(Test3[,v] >= 999999900, NA, Test3[,v])
+# Test1[, paste0('v_', v)] <-
+#     label.numeric(Test1[, v], cuts)
+# Test2[, paste0('v_', v)] <-
+#     label.numeric(Test2[, v], cuts)
+# Test3[, paste0('v_', v)] <-
+#     label.numeric(Test3[, v], cuts)
+# # woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# # woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'hour_submit'
+# Train.bal[, paste0('v_', v)] <- Train.bal[, v]
+# Train[, paste0('v_', v)] <- Train[, v]
+# Test[, paste0('v_', v)] <- Test[, v]
+# Test1[, paste0('v_', v)] <- Test1[, v]
+# Test2[, paste0('v_', v)] <- Test2[, v]
+# Test3[, paste0('v_', v)] <- Test3[, v]
+# woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+# v <- 'hour_submit'
+# Train.bal[, paste0('v_', v)] <- Train.bal[, v]
+# Train[, paste0('v_', v)] <- Train[, v]
+# Test[, paste0('v_', v)] <- Test[, v]
+# Test1[, paste0('v_', v)] <- Test1[, v]
+# Test2[, paste0('v_', v)] <- Test2[, v]
+# Test3[, paste0('v_', v)] <- Test3[, v]
+# woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# 
+v <- 'jion_life_insure'
+Train.bal[, paste0('v_', v)] <- label.factor(Train.bal[, v])
+Train[, paste0('v_', v)] <- label.factor(Train[, v], levels(Train.bal[, paste0('v_', v)]))
+Test[, paste0('v_', v)] <- label.factor(Test[, v], levels(Train.bal[, paste0('v_', v)]))
+Test1[, paste0('v_', v)] <- label.factor(Test1[, v], levels(Train.bal[, paste0('v_', v)]))
+Test2[, paste0('v_', v)] <- label.factor(Test2[, v], levels(Train.bal[, paste0('v_', v)]))
+Test3[, paste0('v_', v)] <- label.factor(Test3[, v], levels(Train.bal[, paste0('v_', v)]))
+# woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+
+# v <- 'age'
+# cuts <- c(18.5,20.5,21.5,23.5,26.5,33.5,37.5,39.5,44.5,50.5)
+# Train.bal[,v] <- ifelse(Train.bal[,v] >= 999999900, NA, Train.bal[,v])
+# Train[,v] <- ifelse(Train[,v] >= 999999900, NA, Train[,v])
+# Test[,v] <- ifelse(Test[,v] >= 999999900, NA, Test[,v])
+# Train.bal[, paste0('v_', v)] <-
+#     label.numeric(Train.bal[, v], cuts)
+# Train[, paste0('v_', v)] <-
+#     label.numeric(Train[, v], cuts)
+# Test[, paste0('v_', v)] <-
+#     label.numeric(Test[, v], cuts)
+# woe(Train.bal, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# woe(Train, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+# woe(Test, paste0('v_', v), FALSE, 'fpd90', 10, '0', '1')
+
+predictors <- colnames(Train.bal)[grepl('^v_.*' ,colnames(Train.bal)) & !grepl('_woe$' ,colnames(Train.bal))]
+# Train.bset <- Train.bal[, c('fpd90', predictors)]
+# Train.set <- Train[, c('fpd90', predictors)]
+# Test.set <- Test[, c('fpd90', predictors)]
+
+iv.table <- data.frame(Var = NULL, Train.bal = NULL, Train = NULL, 
+                      Test = NULL)
+woe.table <- data.frame(Var = NULL, Set = NULL, BIN = NULL, BAD = NULL,
+                        GOOD = NULL, TOTAL = NULL, `BAD%` = NULL, `GOOD%` = NULL,
+                        `TOTAL%` = NULL, WOE = NULL, IV = NULL, BAD_SPLIT = NULL,
+                        GOOD_SPLIT = NULL)
+psi.table <- data.frame(Var = NULL, PSI = NULL)
+
+for (predictor in predictors) {
+    
+    iv.table <- rbind(
+        iv.table,
+        data.frame(
+            Var = predictor,
+            Train.bal = iv(Train.bal$fpd90, Train.bal[, predictor]),
+            Train = iv(Train$fpd90, Train[, predictor]),
+            Test = iv(Test$fpd90, Test[, predictor])
+        )
+    )
+
+    .woe <- woe(Train.bal, predictor, FALSE, 'fpd90', 10, '1', '0')
+    woe.table <- rbind(
+        woe.table,
+        cbind(
+            Var = predictor,
+            Set = 'Train.bal',
+            .woe
+        )
+    )
+    Train.bal[, paste0(predictor, '_woe')] <-
+        .woe[match(Train.bal[, predictor], .woe$BIN), 'WOE']
+
+    woe.table <- rbind(
+        woe.table,
+        cbind(
+            Var = predictor,
+            Set = "Train",
+            woe(Train, predictor, FALSE, 'fpd90', 10, '1', '0')
+        )
+    )
+    Train[, paste0(predictor, '_woe')] <-
+        .woe[match(Train[, predictor], .woe$BIN), 'WOE']
+
+    woe.table <- rbind(
+        woe.table,
+        cbind(
+            Var = predictor,
+            Set = "Test",
+            woe(Test, predictor, FALSE, 'fpd90', 10, '1', '0')
+        )
+    )
+    Test[, paste0(predictor, '_woe')] <-
+        .woe[match(Test[, predictor], .woe$BIN), 'WOE']
+    Test1[, paste0(predictor, '_woe')] <-
+        .woe[match(Test1[, predictor], .woe$BIN), 'WOE']
+    Test2[, paste0(predictor, '_woe')] <-
+        .woe[match(Test2[, predictor], .woe$BIN), 'WOE']
+    Test3[, paste0(predictor, '_woe')] <-
+        .woe[match(Test3[, predictor], .woe$BIN), 'WOE']
+    
+    psi.table <- rbind(
+        psi.table,
+        data.frame(
+            Var = predictor,
+            PSI = psi(Train[, predictor], Test[, predictor])
+        )
+    )
+}
+
+psi.table$IV <- iv.table$Train
+psi.table <- psi.table[, c('Var', 'IV', 'PSI')]
+pander(psi.table)
+```
+
+## Logistic Model
+
+```{r model}
+predictors <- colnames(Train.bal)[grepl('v_.*_WOE' ,colnames(Train.bal))]
+x <- Train.bal[, c('fpd90', predictors)]
+x0 <- Train[, c('fpd90', predictors)]
+x1 <- Test[, c('fpd90', predictors)]
+x.1 <- Test1[, c('fpd90', predictors)]
+x.2 <- Test2[, c('fpd90', predictors)]
+x.3 <- Test3[, c('fpd90', predictors)]
+
+# formula <- 
+# fpd90 ~ v_gender_cd_woe + v_varsmaxcdiffreptmandisstmineffect_woe + 
+#     v_add_corltt_woe + v_numc_acct_woe + v_amtl_apos6m_woe + 
+#     v_diploma_woe + v_amtc_1srpa030_woe + v_amtc_utlcop_woe +
+#     v_amtc_trp_woe + v_numl_lpdm_woe + v_amtc_htpdever_woe + 
+#     v_amtc_1lula120_woe + v_numl_os_woe +
+#     v_amtc_1srpa000_woe + v_varsmaxcdiffreptmandisstmnotactivated_woe + 
+#     v_numc_acctpd_woe + v_numl_insos_woe + v_amtc_1lsla120_woe + 
+#     v_numc_lpdm_woe + v_no_mob_woe + v_no_telwk_woe + v_amtc_1lcla120_woe + 
+#     v_amtc_1m6la120_woe + v_amtc_1ssla120_woe + v_amtc_1smua120_woe + 
+#     v_amtc_1srpa120_woe + v_nums_acct_woe + v_num_emp2y_woe + 
+#     v_rtnumcacctnormaltonumc_woe
+# 
+index <- 1
+while(TRUE) {
+    cat('Round: ', index, '\n')
+    cat('Formula: ')
+    print(formula)
+    existed_terms <- all.vars(formula)[-1]
+    model.accuracy <- data.frame(Model = NULL, Accuracy = NULL)
+    for (new_var in colnames(x)[-1]) {
+      if (!new_var %in% existed_terms) {
+        new_formula <- update(formula, paste0('. ~ . + ', new_var))
+        # print(new_formula)
+        acc <- cv.glm(new_formula, x, seed = 1, family = binomial('logit'))
+        model.accuracy <- rbind(model.accuracy,
+                                data.frame(Model = paste('+ ', new_var),
+                                           Accuracy = acc[1]))
+      }
+    }
+    if (length(existed_terms) >= 2) {
+      for (old_var in existed_terms) {
+        new_formula <- update(formula, paste0('. ~ . - ', old_var))
+        acc <- cv.glm(new_formula, x, seed = 1, family = binomial('logit'))
+        model.accuracy <- rbind(model.accuracy,
+                                data.frame(Model = paste('- ', old_var),
+                                           Accuracy = acc[1]))
+      }
+    }
+    acc <- cv.glm(formula, x, seed = 1, family = binomial('logit'))
+    model.accuracy <- rbind(data.frame(Model = '.', Accuracy = acc[1]),
+                            model.accuracy)
+    model.accuracy <- model.accuracy[order(model.accuracy$Accuracy, decreasing = TRUE), ]
+    pander(model.accuracy)
+
+    new.var <- model.accuracy$Model[1] %>% as.character()
+    if (new.var == '.') break
+    formula <- update(formula, paste0('. ~ . ', new.var) %>% as.formula())
+    index <- index + 1
+}
+formula <-
+fpd90 ~ v_gender_cd_woe + v_varsmaxcdiffreptmandisstmineffect_woe +
+    v_add_corltt_woe + v_numc_acct_woe + v_amtl_apos6m_woe +
+    v_diploma_woe + v_amtc_1srpa030_woe + v_amtc_utlcop_woe +
+    v_amtc_trp_woe + v_numl_lpdm_woe + v_amtc_htpdever_woe +
+    v_amtc_1lula120_woe + v_numl_os_woe +
+    v_amtc_1srpa000_woe + v_varsmaxcdiffreptmandisstmnotactivated_woe +
+    v_numc_acctpd_woe + v_numl_insos_woe + v_amtc_1lsla120_woe +
+    v_numc_lpdm_woe + v_no_mob_woe + v_no_telwk_woe + v_amtc_1lcla120_woe +
+    v_amtc_1m6la120_woe + v_amtc_1ssla120_woe + v_amtc_1smua120_woe +
+    v_amtc_1srpa120_woe + v_nums_acct_woe + v_num_emp2y_woe +
+    v_rtnumcacctnormaltonumc_woe + v_jion_life_insure_woe - 1
+
+# formula <- 
+# fpd90 ~ v_gender_cd_woe + v_varsmaxcdiffreptmandisstmineffect_woe + 
+#     v_add_corltt_woe + v_numc_acct_woe +
+#     v_diploma_woe + v_amtc_1srpa030_woe + v_amtc_utlcop_woe +
+#     v_amtc_trp_woe + v_numl_lpdm_woe + v_amtc_htpdever_woe + 
+#     v_amtc_1lula120_woe + v_numl_os_woe +
+#     v_amtc_1srpa000_woe + v_varsmaxcdiffreptmandisstmnotactivated_woe + 
+#     v_numl_insos_woe + v_amtc_1lsla120_woe + 
+#     v_no_mob_woe + v_no_telwk_woe + v_amtc_1lcla120_woe + 
+#     v_amtc_1m6la120_woe + v_amtc_1ssla120_woe + v_amtc_1smua120_woe + 
+#     v_amtc_1srpa120_woe + v_nums_acct_woe + v_num_emp2y_woe + 
+#     v_rtnumcacctnormaltonumc_woe + v_jion_life_insure_woe - 1
+
+lg.mod <- glm(formula, x, family = binomial('logit'))
+train.pred <- predict(lg.mod, newdata = x0, type = 'response')
+train.prediction <- prediction(train.pred, x0$fpd90)
+train.roc <- performance(train.prediction, 'tpr', 'fpr')
+train.auc <- performance(train.prediction, 'auc')@y.values[[1]]
+train.ks <- max(train.roc@y.values[[1]] - train.roc@x.values[[1]])
+
+test.pred <- predict(lg.mod, newdata = x1, type = 'response')
+test.prediction <- prediction(test.pred, x1$fpd90)
+test.roc <- performance(test.prediction, 'tpr', 'fpr')
+test.auc <- performance(test.prediction, 'auc')@y.values[[1]]
+test.ks <- max(test.roc@y.values[[1]] - test.roc@x.values[[1]])
+
+test1.pred <- predict(lg.mod, newdata = x.1, type = 'response')
+test1.prediction <- prediction(test1.pred, x.1$fpd90)
+test1.roc <- performance(test1.prediction, 'tpr', 'fpr')
+test1.auc <- performance(test1.prediction, 'auc')@y.values[[1]]
+test1.ks <- max(test1.roc@y.values[[1]] - test1.roc@x.values[[1]])
+
+test2.pred <- predict(lg.mod, newdata = x.2, type = 'response')
+test2.prediction <- prediction(test2.pred, x.2$fpd90)
+test2.roc <- performance(test2.prediction, 'tpr', 'fpr')
+test2.auc <- performance(test2.prediction, 'auc')@y.values[[1]]
+test2.ks <- max(test2.roc@y.values[[1]] - test2.roc@x.values[[1]])
+
+test3.pred <- predict(lg.mod, newdata = x.3, type = 'response')
+test3.prediction <- prediction(test3.pred, x.3$fpd90)
+test3.roc <- performance(test3.prediction, 'tpr', 'fpr')
+test3.auc <- performance(test3.prediction, 'auc')@y.values[[1]]
+test3.ks <- max(test3.roc@y.values[[1]] - test3.roc@x.values[[1]])
+
+pander(summary(lg.mod)$coefficients)
+```
+
+### Model Performance
+
+Model performance on sample sets:
+
+```{r model-perf}
+perf.tbl <- data.frame(
+    Set = c('Train', 'Sep.', 'Oct.', 'Sep. & Oct.', 'Rand in Sep. & Oct.'),
+    Gini = c(train.auc, test.auc, test1.auc, test2.auc, test3.auc) * 2 - 1,
+    KS = c(train.ks, test.ks, test1.ks, test2.ks, test3.ks)
+)
+pander(perf.tbl)
+```
+
+ROC Curves:
+
+```{r roc-curve}
+train<- data.frame(tpr = train.roc@y.values[[1]], fpr = train.roc@x.values[[1]])
+test<- data.frame(tpr = test.roc@y.values[[1]], 
+                            fpr = test.roc@x.values[[1]])
+ 
+test1<- data.frame(tpr = test1.roc@y.values[[1]], 
+                              fpr = test1.roc@x.values[[1]])
+ 
+test2<- data.frame(tpr = test2.roc@y.values[[1]], 
+                              fpr = test2.roc@x.values[[1]])
+ 
+test3<- data.frame(tpr = test3.roc@y.values[[1]], 
+                              fpr = test3.roc@x.values[[1]])
+
+
+plot1<-rbind(mutate(train,type = "Train"),
+             mutate(test,type = "Sep"),
+             mutate(test1,type = "Oct"),
+             mutate(test2,type = "Sep&Oct"),
+             mutate(test3,type = "Rand")
+)
+
+p <- ggplot(data=plot1, aes(x=fpr, y=tpr,group=type, colour=type)) + 
+    geom_line(size = 0.5) +
+    labs(title = "ROC Curves") +
+    labs(y = "True positive rate") +
+    labs(x = "False positive rate")
+p
+```
+
+## Comparison with DT AF model
+
+### Comparison on samples in 2016-09. Target: FPD90
+
+```{r comp-sep}
+comparison <- readRDS('full_cash_af_rm_score_20170317.rds')
+Sample <- subset(comparison,
+                 dmonth.x == '2016-09' & !is.na(fpd90))
+
+cash.pred <- prediction(Sample$prob_cash, Sample$fpd90)
+cash.roc <- performance(cash.pred, 'tpr', 'fpr')
+cash.ks <- max(cash.roc@y.values[[1]] - cash.roc@x.values[[1]])
+cash.gini <- performance(cash.pred, 'auc')@y.values[[1]] * 2 - 1
+
+af.pred <- prediction(Sample$prob_af, Sample$fpd90)
+af.roc <- performance(af.pred, 'tpr', 'fpr')
+af.ks <- max(af.roc@y.values[[1]] - af.roc@x.values[[1]])
+af.gini <- performance(af.pred, 'auc')@y.values[[1]] * 2 - 1
+
+cmp.tbl <- data.frame(Model = c('CASH', 'AF'),
+                      Gini = c(cash.gini, af.gini),
+                      KS = c(cash.ks, af.ks))
+
+pander(cmp.tbl)
+
+data <- rbind(data.frame(tpr = cash.roc@y.values[[1]],
+                         fpr = cash.roc@x.values[[1]],
+                         type = 'cash'),
+              data.frame(tpr = af.roc@y.values[[1]],
+                         fpr = af.roc@x.values[[1]],
+                         type = 'af'))
+ggplot(data, aes(x = fpr, y = tpr, group = type, colour = type)) +
+    geom_line() + 
+    labs(title = 'Comparison between CASH and AF model (Sep., FPD90)',
+         x = 'False Positive Rate', y = 'True Positive Rate')
+```
+
+### Comparison on samples in 2017-01. Target: FPD10
+
+```{r comp-jan}
+Sample <- subset(comparison,
+                 dmonth.x == '2017-01' & !is.na(fpd10))
+
+cash.pred <- prediction(Sample$prob_cash, Sample$fpd10)
+cash.roc <- performance(cash.pred, 'tpr', 'fpr')
+cash.ks <- max(cash.roc@y.values[[1]] - cash.roc@x.values[[1]])
+cash.gini <- performance(cash.pred, 'auc')@y.values[[1]] * 2 - 1
+
+af.pred <- prediction(Sample$prob_af, Sample$fpd10)
+af.roc <- performance(af.pred, 'tpr', 'fpr')
+af.ks <- max(af.roc@y.values[[1]] - af.roc@x.values[[1]])
+af.gini <- performance(af.pred, 'auc')@y.values[[1]] * 2 - 1
+
+cmp.tbl <- data.frame(Model = c('CASH', 'AF'),
+                      Gini = c(cash.gini, af.gini),
+                      KS = c(cash.ks, af.ks))
+
+pander(cmp.tbl)
+
+data <- rbind(data.frame(tpr = cash.roc@y.values[[1]],
+                         fpr = cash.roc@x.values[[1]],
+                         type = 'cash'),
+              data.frame(tpr = af.roc@y.values[[1]],
+                         fpr = af.roc@x.values[[1]],
+                         type = 'af'))
+ggplot(data, aes(x = fpr, y = tpr, group = type, colour = type)) +
+    geom_line() +
+    labs(title = 'Comparison between CASH and AF model (Jan., FPD10)',
+         x = 'False Positive Rate', y = 'True Positive Rate')
+```
+
+As for the performance of two models on January samples, the difference is too large, which is very suspicious. We will investigate to find the reason.
